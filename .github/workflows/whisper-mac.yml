@@ -1,0 +1,87 @@
+name: whisper-mac
+# Builds a self-contained universal (arm64 + x86_64) whisper-cli for macOS and publishes it
+# as release "engine-whisper-mac-1" (never marked latest). Used by Rawi auto captions / auto edit on Mac.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: whisper.cpp tag
+        default: v1.7.5
+      release:
+        description: release tag to publish to
+        default: engine-whisper-mac-1
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - name: Fetch whisper.cpp
+        run: git clone --depth 1 --branch "${{ inputs.tag }}" https://github.com/ggml-org/whisper.cpp src
+      - name: Build arm64
+        working-directory: src
+        run: |
+          cmake -B build-arm64 -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0 -DBUILD_SHARED_LIBS=OFF \
+            -DGGML_METAL=ON -DGGML_METAL_EMBED_LIBRARY=ON -DGGML_BLAS=ON \
+            -DWHISPER_BUILD_TESTS=OFF -DWHISPER_SDL2=OFF
+          cmake --build build-arm64 --config Release -j 4 --target whisper-cli
+      - name: Build x86_64
+        working-directory: src
+        run: |
+          cmake -B build-x64 -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES=x86_64 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0 -DBUILD_SHARED_LIBS=OFF \
+            -DGGML_NATIVE=OFF -DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON \
+            -DGGML_METAL=ON -DGGML_METAL_EMBED_LIBRARY=ON -DGGML_BLAS=ON \
+            -DWHISPER_BUILD_TESTS=OFF -DWHISPER_SDL2=OFF
+          cmake --build build-x64 --config Release -j 4 --target whisper-cli
+      - name: Universal binary
+        working-directory: src
+        run: |
+          A=$(find build-arm64 -name whisper-cli -type f -perm -u+x | head -1)
+          X=$(find build-x64 -name whisper-cli -type f -perm -u+x | head -1)
+          mkdir -p ../out
+          lipo -create "$A" "$X" -output ../out/whisper-cli
+          codesign --force -s - ../out/whisper-cli
+          lipo -info ../out/whisper-cli
+          otool -L ../out/whisper-cli
+          if otool -L ../out/whisper-cli | grep -q '@rpath'; then echo "rpath dependency found"; exit 1; fi
+          cp LICENSE ../out/LICENSE-whisper.cpp.txt
+      - name: Smoke test (arm64)
+        working-directory: src
+        run: |
+          bash models/download-ggml-model.sh tiny
+          ../out/whisper-cli -m models/ggml-tiny.bin -f samples/jfk.wav -ml 1 -sow -ojf -of /tmp/out
+          test -s /tmp/out.json
+          ../out/whisper-cli -ng -m models/ggml-tiny.bin -f samples/jfk.wav -ml 1 -sow -ojf -of /tmp/out_ng
+          test -s /tmp/out_ng.json
+          head -c 600 /tmp/out.json
+      - name: Smoke test (x86_64 via Rosetta)
+        continue-on-error: true
+        working-directory: src
+        run: |
+          softwareupdate --install-rosetta --agree-to-license || true
+          arch -x86_64 ../out/whisper-cli -m models/ggml-tiny.bin -f samples/jfk.wav -ml 1 -sow -ojf -of /tmp/out_x
+          test -s /tmp/out_x.json
+      - name: Zip
+        working-directory: out
+        run: |
+          chmod 755 whisper-cli
+          zip -j ../Rawi-whisper-mac.zip whisper-cli LICENSE-whisper.cpp.txt
+          shasum -a 256 ../Rawi-whisper-mac.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Rawi-whisper-mac
+          path: Rawi-whisper-mac.zip
+      - name: Publish release (not latest)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          R="${{ inputs.release }}"
+          if gh release view "$R" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$R" Rawi-whisper-mac.zip --clobber -R "$GITHUB_REPOSITORY"
+          else
+            gh release create "$R" Rawi-whisper-mac.zip -R "$GITHUB_REPOSITORY" --latest=false \
+              --title "Rawi engine: whisper-cli for macOS" \
+              --notes "Universal (Apple Silicon + Intel) whisper-cli built from whisper.cpp ${{ inputs.tag }} (MIT). Used by Rawi auto captions / auto edit on Mac."
+          fi
